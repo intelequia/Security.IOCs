@@ -1,0 +1,282 @@
+let iocs = externaldata(DateAdded: string, IoC: string, Type: string, TLP: string) [@"https://raw.githubusercontent.com/intelequia/Security.IOCs/main/ZuoRAT_IoCs.csv"] with (format="csv", ignoreFirstRecord=True);
+let IPList = (iocs | where Type =~ "ip" | project IoC);
+let sha256Hashes = (iocs | where Type == "sha256" | project IoC);
+let FilePaths = (iocs | where Type =~ "FilePath" | project IoC);
+let POST_URI = (iocs | where Type =~ "URI1" | project IoC);
+let GET_URI = (iocs | where Type =~ "URI2" | project IoC);
+(union isfuzzy=true 
+    (CommonSecurityLog 
+    | where isnotempty(SourceIP) or isnotempty(DestinationIP) 
+    | where SourceIP in (IPList) or DestinationIP in (IPList) or Message has_any (IPList) or FileHash in (sha256Hashes)
+    | extend IPMatch = case(SourceIP has_any (IPList), "SourceIP", DestinationIP has_any (IPList), "DestinationIP", "Message")  
+    | summarize StartTimeUtc = min(TimeGenerated), EndTimeUtc = max(TimeGenerated)
+        by
+        SourceIP,
+        DestinationIP,
+        DeviceProduct,
+        DeviceAction,
+        Message,
+        Protocol,
+        SourcePort,
+        DestinationPort,
+        DeviceAddress,
+        DeviceName,
+        IPMatch 
+    | extend
+        timestamp = StartTimeUtc,
+        IPCustomEntity = case(IPMatch == "SourceIP", SourceIP, IPMatch == "DestinationIP", DestinationIP, "IP in Message Field")  
+    ), 
+    (OfficeActivity 
+    | extend SourceIPAddress = ClientIP, Account = UserId 
+    | where SourceIPAddress has_any (IPList) 
+    | extend
+        timestamp = TimeGenerated,
+        IPCustomEntity = SourceIPAddress,
+        AccountCustomEntity = Account 
+    ),
+    (_Im_Dns
+    | where DstIPAddr has_any (IPList) or SrcIpAddr has_any (IPList)
+    | extend DestinationIPAddress = ResponseName, Host = SrcIpAddr 
+    | extend
+        timestamp = TimeGenerated,
+        IPCustomEntity = DestinationIPAddress,
+        HostCustomEntity = Host 
+    ), 
+    (_Im_NetworkSession
+    | where DstIPAddr has_any (IPList) or SrcIpAddr has_any (IPList)
+    | extend
+        timestamp = TimeGenerated,
+        IPCustomEntity = SrcIpAddr,
+        HostCustomEntity = Hostname,
+        AccountCustomEntity=User
+    ), 
+    (_Im_NetworkSession
+    | where DstIPAddr has_any (IPList) or SrcIpAddr has_any (IPList)
+    | extend
+        timestamp = TimeGenerated,
+        IPCustomEntity = DstIpAddr,
+        HostCustomEntity = Hostname,
+        AccountCustomEntity = User
+    ), 
+    (WireData  
+    | where isnotempty(RemoteIP) 
+    | where RemoteIP has_any (IPList) 
+    | extend
+        timestamp = TimeGenerated,
+        IPCustomEntity = RemoteIP,
+        HostCustomEntity = Computer 
+    ), 
+    (SigninLogs 
+    | where isnotempty(IPAddress) 
+    | where IPAddress has_any (IPList) 
+    | extend
+        timestamp = TimeGenerated,
+        AccountCustomEntity = UserPrincipalName,
+        IPCustomEntity = IPAddress 
+    ),
+    (AADNonInteractiveUserSignInLogs 
+    | where isnotempty(IPAddress) 
+    | where IPAddress has_any (IPList) 
+    | extend
+        timestamp = TimeGenerated,
+        AccountCustomEntity = UserPrincipalName,
+        IPCustomEntity = IPAddress 
+    ), 
+    (W3CIISLog  
+    | where isnotempty(cIP) 
+    | where cIP has_any (IPList) or (csMethod == 'GET' and csUriStem has_any (GET_URI)) or (csMethod == 'POST' and csUriStem has_any (POST_URI))
+    | extend
+        timestamp = TimeGenerated,
+        IPCustomEntity = cIP,
+        HostCustomEntity = Computer,
+        AccountCustomEntity = csUserName 
+    ), 
+    (AzureActivity  
+    | where isnotempty(CallerIpAddress) 
+    | where CallerIpAddress has_any (IPList) 
+    | extend
+        timestamp = TimeGenerated,
+        IPCustomEntity = CallerIpAddress,
+        AccountCustomEntity = Caller 
+    ), 
+    ( 
+    DeviceNetworkEvents 
+    | where isnotempty(RemoteIP)  
+    | where RemoteIP has_any (IPList) or InitiatingProcessSHA256 has_any (sha256Hashes) or InitiatingProcessFolderPath has_any (FilePaths) 
+    | extend
+        timestamp = TimeGenerated,
+        IPCustomEntity = RemoteIP,
+        HostCustomEntity = DeviceName  
+    ),
+    (
+    AzureDiagnostics
+    | where ResourceType == "AZUREFIREWALLS"
+    | where Category == "AzureFirewallApplicationRule"
+    | parse msg_s with Protocol 'request from ' SourceHost ':' SourcePort 'to ' DestinationHost ':' DestinationPort '. Action:' Action
+    | where isnotempty(DestinationHost)
+    | where DestinationHost has_any (IPList)  
+    | extend DestinationIP = DestinationHost 
+    | extend IPCustomEntity = SourceHost
+    ),
+    (
+    AzureDiagnostics
+    | where ResourceType == "AZUREFIREWALLS"
+    | where Category == "AzureFirewallNetworkRule"
+    | parse msg_s with Protocol 'request from ' SourceHost ':' SourcePort 'to ' DestinationHost ':' DestinationPort '. Action:' Action
+    | where isnotempty(DestinationHost)
+    | where DestinationHost has_any (IPList)  
+    | extend DestinationIP = DestinationHost 
+    | extend IPCustomEntity = SourceHost
+    ),
+    (Event
+    | where Source == "Microsoft-Windows-Sysmon" and EventID == '7'
+    | extend EvData = parse_xml(EventData)
+    | extend EventDetail = EvData.DataItem.EventData.Data
+    | extend ImageLoaded = EventDetail.[5].["#text"], Hashes = EventDetail.[11].["#text"]
+    | parse Hashes with * 'SHA256=' SHA256 '",' *
+    | where ImageLoaded has_any (FilePaths) or SHA256 has_any (sha256Hashes) 
+    | project
+        TimeGenerated,
+        EventDetail,
+        UserName,
+        Computer,
+        Type,
+        Source,
+        SHA256,
+        ImageLoaded,
+        EventID
+    | extend
+        Type = strcat(Type, ":", EventID, ": ", Source),
+        Account = UserName,
+        FileHash = SHA256,
+        Image = EventDetail.[4].["#text"] 
+    | extend
+        timestamp = TimeGenerated,
+        HostCustomEntity = Computer,
+        AccountCustomEntity = Account,
+        ProcessCustomEntity = tostring(split(Image, '\\', -1)[-1]),
+        AlgorithmCustomEntity = "SHA256",
+        FileHashCustomEntity = FileHash
+    ),
+    (DeviceEvents
+    | extend FilePath = strcat(FolderPath, '\\', FileName)
+    | where InitiatingProcessSHA256 has_any (sha256Hashes) or FilePath has_any (FilePaths)
+    | project
+        TimeGenerated,
+        ActionType,
+        DeviceId,
+        DeviceName,
+        InitiatingProcessAccountDomain,
+        InitiatingProcessAccountName,
+        InitiatingProcessCommandLine,
+        InitiatingProcessFolderPath,
+        InitiatingProcessId,
+        InitiatingProcessParentFileName,
+        InitiatingProcessFileName,
+        InitiatingProcessSHA256,
+        Type
+    | extend
+        Account = InitiatingProcessAccountName,
+        Computer = DeviceName,
+        CommandLine = InitiatingProcessCommandLine,
+        FileHash = InitiatingProcessSHA256,
+        Image = InitiatingProcessFolderPath
+    | extend
+        timestamp = TimeGenerated,
+        HostCustomEntity = Computer,
+        AccountCustomEntity = Account,
+        ProcessCustomEntity = InitiatingProcessFileName,
+        AlgorithmCustomEntity = "SHA256",
+        FileHashCustomEntity = FileHash
+    ),
+    (DeviceFileEvents
+    | where FolderPath has_any (FilePaths) or SHA256 has_any (sha256Hashes)
+    | project
+        TimeGenerated,
+        ActionType,
+        DeviceId,
+        DeviceName,
+        InitiatingProcessAccountDomain,
+        InitiatingProcessAccountName,
+        InitiatingProcessCommandLine,
+        InitiatingProcessFolderPath,
+        InitiatingProcessId,
+        InitiatingProcessParentFileName,
+        InitiatingProcessFileName,
+        InitiatingProcessSHA256,
+        Type
+    | extend
+        Account = InitiatingProcessAccountName,
+        Computer = DeviceName,
+        CommandLine = InitiatingProcessCommandLine,
+        FileHash = InitiatingProcessSHA256,
+        Image = InitiatingProcessFolderPath
+    | extend
+        timestamp = TimeGenerated,
+        HostCustomEntity = Computer,
+        AccountCustomEntity = Account,
+        ProcessCustomEntity = InitiatingProcessFileName,
+        AlgorithmCustomEntity = "SHA256",
+        FileHashCustomEntity = FileHash
+    ),
+    (DeviceImageLoadEvents
+    | where FolderPath has_any (FilePaths) or SHA256 has_any (sha256Hashes)
+    | project
+        TimeGenerated,
+        ActionType,
+        DeviceId,
+        DeviceName,
+        InitiatingProcessAccountDomain,
+        InitiatingProcessAccountName,
+        InitiatingProcessCommandLine,
+        InitiatingProcessFolderPath,
+        InitiatingProcessId,
+        InitiatingProcessParentFileName,
+        InitiatingProcessFileName,
+        InitiatingProcessSHA256,
+        Type
+    | extend
+        Account = InitiatingProcessAccountName,
+        Computer = DeviceName,
+        CommandLine = InitiatingProcessCommandLine,
+        FileHash = InitiatingProcessSHA256,
+        Image = InitiatingProcessFolderPath
+    | extend
+        timestamp = TimeGenerated,
+        HostCustomEntity = Computer,
+        AccountCustomEntity = Account,
+        ProcessCustomEntity = InitiatingProcessFileName,
+        AlgorithmCustomEntity = "SHA256",
+        FileHashCustomEntity = FileHash
+    ),
+    (Event
+    | where Source == "Microsoft-Windows-Sysmon"
+    | extend EvData = parse_xml(EventData)
+    | extend EventDetail = EvData.DataItem.EventData.Data
+    | parse EventDetail with * 'SHA256=' SHA256 '",' *
+    | where EventDetail has_any (sha256Hashes) 
+    | project TimeGenerated, EventDetail, UserName, Computer, Type, Source, SHA256
+    | extend
+        Type = strcat(Type, ": ", Source),
+        Account = UserName,
+        FileHash = SHA256,
+        Image = EventDetail.[4].["#text"] 
+    | extend
+        timestamp = TimeGenerated,
+        HostCustomEntity = Computer,
+        AccountCustomEntity = Account,
+        ProcessCustomEntity = tostring(split(Image, '\\', -1)[-1]),
+        AlgorithmCustomEntity = "SHA256",
+        FileHashCustomEntity = FileHash
+    ),
+    (imFileEvent
+    | where TargetFileSHA256 has_any (sha256Hashes) or FilePath has_any (FilePaths)
+    | extend
+        Account = ActorUsername,
+        Computer = DvcHostname,
+        IPAddress = SrcIpAddr,
+        CommandLine = ActingProcessCommandLine,
+        FileHash = TargetFileSHA256
+    | project Type, TimeGenerated, Computer, Account, IPAddress, CommandLine, FileHash
+    )
+)
